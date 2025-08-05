@@ -83,9 +83,8 @@ async def send_daily_holidays_notification(context: ContextTypes.DEFAULT_TYPE):
     logger.info("Запуск задачи по отправке уведомлений о праздниках.", extra={'context': log_ctx})
 
     tz = pytz.timezone(config.TZ_INFO)
-    tomorrow = (datetime.now(tz) + timedelta(days=1)).date()
-
-    message_text = await _create_holidays_message(tomorrow)
+    today = (datetime.now(tz)).date()
+    message_text = await _create_holidays_message(today)
 
     if message_text:
         await context.bot.send_message(
