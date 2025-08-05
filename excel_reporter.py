@@ -79,7 +79,7 @@ def generate_holidays_report(start_date: str, end_date: str) -> str:
     workbook = openpyxl.Workbook()
     sheet = workbook.active
     # ИЗМЕНЕНО: Заголовок листа
-    sheet.title = f"Holidays {start_date} to {end_date}"
+    sheet.title = f"rep_{start_date}_{end_date}"
 
     # Стили (без изменений)
     header_font = Font(bold=True, size=12)
