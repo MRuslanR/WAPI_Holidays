@@ -6,14 +6,14 @@ from datetime import date
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from collections import defaultdict
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Tuple
 
 import config
 
 logger = config.get_logger(__name__)
 
 
-def get_next_month_dates():
+def get_next_month_dates() -> Tuple[int, str, str, str]:
     """
     Определяет год, следующий месяц и формирует даты начала и конца
     следующего месяца в формате ISO (YYYY-MM-DD), а также название месяца.
@@ -166,7 +166,8 @@ def _send_email(recipient: str, subject: str, html_body: str) -> bool:
         return False
 
 
-def send_holiday_email_to_all() -> dict:
+# --- ИЗМЕНЕНО: Функция теперь принимает параметры ---
+def send_holiday_email_to_all(year: int, month_name: str, start_date: str, end_date: str) -> dict:
     """
     Основная функция модуля: готовит и рассылает письма всем получателям.
     Возвращает словарь со статусом операции.
@@ -178,9 +179,8 @@ def send_holiday_email_to_all() -> dict:
         logger.warning("Список email-получателей пуст. Рассылка отменена.")
         return {'success': False, 'error': 'Список получателей пуст.'}
 
-    # 1. Получаем данные
-    year, month_name, first_day, last_day = get_next_month_dates()
-    holidays_by_country = fetch_holidays_for_period(config.DB_PATH, first_day, last_day)
+    # 1. Получаем данные (даты теперь передаются как аргументы)
+    holidays_by_country = fetch_holidays_for_period(config.DB_PATH, start_date, end_date)
 
     # 2. Форматируем письмо
     email_subject = f"Календарь праздников на {month_name} {year}"
@@ -200,4 +200,10 @@ def send_holiday_email_to_all() -> dict:
     }
 
 if __name__ == '__main__':
-    send_holiday_email_to_all()
+    # Этот блок позволяет запускать скрипт отдельно для тестирования
+    logger.info("Запуск email_sender в автономном режиме для теста.")
+    # Получаем даты для следующего месяца
+    test_year, test_month_name, test_first_day, test_last_day = get_next_month_dates()
+    # Вызываем основную функцию с полученными датами
+    result = send_holiday_email_to_all(test_year, test_month_name, test_first_day, test_last_day)
+    print(f"Результат тестовой рассылки: {result}")

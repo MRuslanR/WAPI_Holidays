@@ -1,9 +1,9 @@
-# bot.py
 import asyncio
 import os
 import traceback
 from datetime import datetime, time, timedelta, date
 from typing import Optional
+import calendar
 
 import pytz
 from telegram import Update, ReplyKeyboardMarkup, BotCommand
@@ -15,11 +15,13 @@ from telegram.ext import (
     MessageHandler,
     ContextTypes,
     filters,
-    ConversationHandler
+    ConversationHandler,
+    PicklePersistence 
 )
 
 import config
 import excel_reporter
+import email_sender
 from services import HolidayService
 
 config.setup_logging()
@@ -31,7 +33,205 @@ BTN_CREATE_REPORT = "Сгенерировать Excel-отчет 📊"
 GET_START_DATE, GET_END_DATE, GET_SPECIFIC_DATE = range(3)
 
 
-# --- ИЗМЕНЕНО: Обновляем вспомогательную функцию для вывода регионов ---
+# --- НОВЫЕ ФУНКЦИИ ДЛЯ ЕЖЕМЕСЯЧНОЙ ЗАДАЧИ ---
+
+def get_next_date_for_job():
+    """Рассчитывает даты для следующего месяца. Аналог функции из main.py"""
+    today = date.today()
+    year = today.year
+    if today.month == 12:
+        next_month = 1
+        year += 1
+    else:
+        next_month = today.month + 1
+
+    last_day_of_month = calendar.monthrange(year, next_month)[1]
+    first_day = date(year, next_month, 1).isoformat()
+    last_day = date(year, next_month, last_day_of_month).isoformat()
+    return str(year), str(next_month).zfill(2), first_day, last_day
+
+
+async def run_monthly_data_collection(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Основная логика сбора данных за следующий месяц и отправки отчетов.
+    Вызывается планировщиком.
+    """
+    job_name = context.job.name if context.job else 'manual_run'
+    log_ctx = {'job_name': job_name}
+    logger.info("Запуск ежемесячной задачи по сбору данных о праздниках...", extra={'context': log_ctx})
+
+    await context.bot.send_message(
+        chat_id=config.TELEGRAM_CHANNEL_ID,
+        text="🚀 Начинаю ежемесячный сбор данных о праздниках на следующий месяц..."
+    )
+
+    try:
+        countries_for_holidays = config.COUNTRIES
+        if not countries_for_holidays:
+            logger.warning("Список стран для сбора праздников пуст. Обработка пропускается.",
+                           extra={'context': log_ctx})
+            await context.bot.send_message(
+                chat_id=config.TELEGRAM_CHANNEL_ID,
+                text="⚠️ Список стран для обработки пуст. Ежемесячный сбор данных пропущен."
+            )
+            return
+
+        year, next_month_str, first_day, last_day = get_next_date_for_job()
+        period_str = f"{next_month_str}/{year}"
+        logger.info(f"Целевой период для сбора: {period_str}", extra={'context': log_ctx})
+
+        # Инициализируем сервис
+        holiday_service = HolidayService()
+
+        # Запускаем обработку для каждой страны
+        for country_code in countries_for_holidays:
+            try:
+                holiday_service.process_holidays_for_period(
+                    country_code=country_code,
+                    year=year,
+                    month=next_month_str,
+                    first_day=first_day,
+                    last_day=last_day
+                )
+            except Exception as e:
+                logger.critical(f"Критическая ошибка при обработке страны {country_code}: {e}", exc_info=True)
+                # Отправим сообщение об ошибке, но продолжим с другими странами
+                await context.bot.send_message(
+                    chat_id=config.TELEGRAM_CHANNEL_ID,
+                    text=f"❌ Критическая ошибка при обработке страны {country_code}: {e}"
+                )
+
+        # Экранируем все динамические части для безопасности
+        escaped_period = escape_markdown(period_str, version=2)
+        escaped_countries = escape_markdown(', '.join(countries_for_holidays), version=2)
+        escaped_tokens = escape_markdown(str(holiday_service.grand_total_tokens), version=2)
+
+        price_str = f"{holiday_service.grand_total_price:.4f}"
+        escaped_price = escape_markdown(price_str, version=2)
+
+        summary_message = (
+            f"✅ *Ежемесячный сбор данных успешно завершен* ✨\n\n"
+            f"*Обработанный период:* `{escaped_period}`\n"
+            f"*Страны:* `{escaped_countries}`\n\n"
+            f"📊 *Итоги по экономике:*\n"
+            f"  • Всего потрачено токенов: `{escaped_tokens}`\n"
+            f"  • Итоговая стоимость: `{escaped_price}$`\n\n"
+            f"⏳ Начинаю генерацию Excel отчета\\.\\.\\."
+        )
+        await context.bot.send_message(
+            chat_id=config.TELEGRAM_CHANNEL_ID,
+            text=summary_message,
+            parse_mode='MarkdownV2'
+        )
+        # Генерируем и отправляем Excel-отчет
+        logger.info("Генерация Excel-отчета...", extra={'context': log_ctx})
+        report_path = await asyncio.to_thread(
+            excel_reporter.generate_holidays_report, start_date=first_day, end_date=last_day
+        )
+        with open(report_path, 'rb') as report_file:
+            await context.bot.send_document(
+                chat_id=config.TELEGRAM_CHANNEL_ID,
+                document=report_file,
+                filename=os.path.basename(report_path),
+                caption=f"📊 Excel-отчет по праздникам на {period_str} готов!"
+            )
+        if report_path and os.path.exists(report_path):
+            os.remove(report_path)
+            logger.info(f"Временный файл отчета {report_path} удален.", extra={'context': log_ctx})
+
+        # --- НАЧАЛО НОВОГО БЛОКА: ОТПРАВКА EMAIL-УВЕДОМЛЕНИЙ ---
+        if config.EMAIL_NOTIFICATIONS_ENABLED:
+            logger.info("Начинаю отправку email-уведомлений...")
+            await context.bot.send_message(
+                chat_id=config.TELEGRAM_CHANNEL_ID,
+                text="📧 Рассылаю email-уведомления подписчикам..."
+            )
+            try:
+                # Получаем имя месяца для письма
+                month_names = ["", "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
+                               "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"]
+                month_name = month_names[int(next_month_str)]
+
+                # Запускаем отправку в отдельном потоке, чтобы не блокировать бота
+                email_result = await asyncio.to_thread(
+                    email_sender.send_holiday_email_to_all,
+                    year=int(year),
+                    month_name=month_name,
+                    start_date=first_day,
+                    end_date=last_day
+                )
+
+                if email_result.get('success'):
+                    success_msg = (
+                        f"✅ Email\\-рассылка успешно завершена\\.\n"
+                        f"Отправлено писем: `{email_result.get('sent_count', 'N/A')}` "
+                        f"из `{email_result.get('total_recipients', 'N/A')}`\\."
+                    )
+                    await context.bot.send_message(
+                        chat_id=config.TELEGRAM_CHANNEL_ID,
+                        text=success_msg,
+                        parse_mode='MarkdownV2'
+                    )
+                else:
+                    error_msg = f"⚠️ Произошла ошибка при отправке email-уведомлений: {email_result.get('error', 'Неизвестная ошибка')}"
+                    logger.error(error_msg, extra={'context': log_ctx})
+                    await context.bot.send_message(
+                        chat_id=config.TELEGRAM_CHANNEL_ID,
+                        text=escape_markdown(error_msg, version=2),
+                        parse_mode='MarkdownV2'
+                    )
+            except Exception as e:
+                logger.critical("Критическая ошибка в модуле отправки email.", exc_info=True)
+                error_message = (
+                    f"❌ *Критическая ошибка при отправке email* ❌\n\n"
+                    f"`{escape_markdown(str(e), version=2)}`"
+                )
+                await context.bot.send_message(
+                    chat_id=config.TELEGRAM_CHANNEL_ID,
+                    text=error_message,
+                    parse_mode='MarkdownV2'
+                )
+        else:
+            logger.info("Email-уведомления отключены в конфигурации.")
+        # --- КОНЕЦ НОВОГО БЛОКА ---
+
+
+    except Exception as e:
+        logger.critical("Произошла критическая ошибка во время выполнения ежемесячной задачи.", exc_info=True)
+        error_message = (
+            f"❌ *Критическая ошибка при выполнении ежемесячного сбора данных* ❌\n\n"
+            f"Произошла непредвиденная ошибка\\. Проверьте логи для детальной информации\\.\n\n"
+            f"*Текст ошибки:*\n`{escape_markdown(str(e), version=2)}`\n\n"
+            f"*Traceback:*\n```\n{escape_markdown(traceback.format_exc(limit=1), version=2)}\n```"
+        )
+        await context.bot.send_message(
+            chat_id=config.TELEGRAM_CHANNEL_ID,
+            text=error_message,
+            parse_mode='MarkdownV2'
+        )
+
+
+async def scheduled_monthly_task(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Проверяет, наступил ли нужный день месяца, и запускает основную задачу.
+    """
+    tz = pytz.timezone(config.TZ_INFO)
+    current_day = datetime.now(tz).day
+
+    logger.debug(
+        f"Ежедневная проверка для ежемесячной задачи. Сегодня {current_day}-е число. Цель: {config.MONTHLY_JOB_DAY}.")
+
+    if current_day == config.MONTHLY_JOB_DAY:
+        logger.info(f"Сегодня {current_day}-е число, запускаю ежемесячный сбор данных.")
+        await run_monthly_data_collection(context)
+    else:
+        logger.info(
+            f"Сегодня {current_day}-е число, ежемесячная задача не запускается (запланирована на {config.MONTHLY_JOB_DAY}-е).")
+
+
+# --- КОНЕЦ НОВЫХ ФУНКЦИЙ ---
+
+
 async def _create_holidays_message(target_date: date) -> Optional[str]:
     """
     Формирует текстовое сообщение о праздниках на указанную дату, включая регионы.
@@ -41,7 +241,6 @@ async def _create_holidays_message(target_date: date) -> Optional[str]:
         target_date_formatted = target_date.strftime('%d.%m.%Y')
 
         holiday_service = HolidayService()
-        # Получаем данные в новой структуре: {'RU': {'Праздник': ['Регион1', 'Регион2']}}
         holidays_by_country = holiday_service.get_holidays_for_date(target_date_str)
 
         escaped_date = escape_markdown(target_date_formatted, version=2)
@@ -54,19 +253,14 @@ async def _create_holidays_message(target_date: date) -> Optional[str]:
             escaped_country_name = escape_markdown(country_code.upper(), version=2)
             message_parts.append(f"\n*{escaped_country_name}*")
 
-            # Получаем словарь {название_праздника: [регионы]}
             holiday_details = holidays_by_country[country_code]
 
-            # Итерируемся по праздникам и их регионам
             for holiday_name, regions in holiday_details.items():
                 escaped_holiday_name = escape_markdown(holiday_name, version=2)
-
-                # Если у праздника есть регионы, добавляем их через тире
                 if regions:
                     escaped_regions = escape_markdown(", ".join(regions), version=2)
                     message_parts.append(f"  \\- {escaped_holiday_name} \\- _{escaped_regions}_")
                 else:
-                    # Если регионов нет, выводим только название
                     message_parts.append(f"  \\- {escaped_holiday_name}")
 
         return "\n".join(message_parts)
@@ -75,8 +269,6 @@ async def _create_holidays_message(target_date: date) -> Optional[str]:
         return None
 
 
-# --- Остальные функции bot.py остаются без изменений ---
-
 async def send_daily_holidays_notification(context: ContextTypes.DEFAULT_TYPE):
     job = context.job
     log_ctx = {'job_name': job.name if job else 'manual_run'}
@@ -84,6 +276,7 @@ async def send_daily_holidays_notification(context: ContextTypes.DEFAULT_TYPE):
 
     tz = pytz.timezone(config.TZ_INFO)
     today = (datetime.now(tz)).date()
+
     message_text = await _create_holidays_message(today)
 
     if message_text:
@@ -213,25 +406,77 @@ def main():
         logger.critical("Токен TELEGRAM_BOT_TOKEN не найден! Бот не может быть запущен.")
         return
 
-    application = ApplicationBuilder().token(config.TELEGRAM_BOT_TOKEN).post_init(post_init).build()
+    # <<< ИЗМЕНЕНИЕ: Создаем объект персистентности
+    # Данные будут сохраняться в файл 'bot_persistence.pickle'
+    persistence = PicklePersistence(filepath="bot_persistence.pickle")
+    # <<< КОНЕЦ ИЗМЕНЕНИЯ
+
+    # <<< ИЗМЕНЕНИЕ: Передаем объект persistence в ApplicationBuilder
+    application = (
+        ApplicationBuilder()
+        .token(config.TELEGRAM_BOT_TOKEN)
+        .persistence(persistence)
+        .post_init(post_init)
+        .build()
+    )
+    # <<< КОНЕЦ ИЗМЕНЕНИЯ
 
     job_queue = application.job_queue
+    tz = pytz.timezone(config.TZ_INFO)
+
+    # <<< ИЗМЕНЕНИЕ: Добавлена проверка на существование задачи перед ее созданием
+    # Планировщик ежедневных уведомлений
+    daily_job_name = "daily_holiday_notification"
     if config.TELEGRAM_CHANNEL_ID and config.DAILY_NOTIFICATION_TIME:
-        try:
-            h, m = map(int, config.DAILY_NOTIFICATION_TIME.split(':'))
-            notification_time = time(h, m, tzinfo=pytz.timezone(config.TZ_INFO))
-            job_queue.run_daily(send_daily_holidays_notification, time=notification_time,
-                                name="daily_holiday_notification")
-            logger.info(
-                f"Запланирована ежедневная отправка уведомлений в {config.DAILY_NOTIFICATION_TIME} ({config.TZ_INFO}).")
-        except (ValueError, TypeError) as e:
-            logger.error(f"Неверный формат времени DAILY_NOTIFICATION_TIME: {e}")
+        # Проверяем, нет ли уже такой задачи (она могла быть восстановлена из файла)
+        if not job_queue.get_jobs_by_name(daily_job_name):
+            try:
+                h, m = map(int, config.DAILY_NOTIFICATION_TIME.split(':'))
+                notification_time = time(h, m, tzinfo=tz)
+                job_queue.run_daily(
+                    send_daily_holidays_notification,
+                    time=notification_time,
+                    name=daily_job_name  # Используем имя для идентификации
+                )
+                logger.info(
+                    f"Запланирована ежедневная отправка уведомлений в {config.DAILY_NOTIFICATION_TIME} ({config.TZ_INFO}).")
+            except (ValueError, TypeError) as e:
+                logger.error(f"Неверный формат времени DAILY_NOTIFICATION_TIME: {e}")
+        else:
+            logger.info(f"Задача '{daily_job_name}' уже была восстановлена из persistence файла.")
+
+    # Планировщик ежемесячного сбора данных
+    monthly_job_name = "monthly_data_collection_job"
+    if config.TELEGRAM_CHANNEL_ID and config.MONTHLY_JOB_ENABLED:
+        # Проверяем, нет ли уже такой задачи
+        if not job_queue.get_jobs_by_name(monthly_job_name):
+            try:
+                h, m = map(int, config.MONTHLY_JOB_TIME.split(':'))
+                job_time = time(h, m, tzinfo=tz)
+                job_queue.run_daily(
+                    scheduled_monthly_task,
+                    time=job_time,
+                    name=monthly_job_name  # Используем имя для идентификации
+                )
+                logger.info(
+                    f"Запланирована ежемесячная задача сбора данных на {config.MONTHLY_JOB_DAY}-е число каждого месяца "
+                    f"в {config.MONTHLY_JOB_TIME} ({config.TZ_INFO})."
+                )
+            except (ValueError, TypeError) as e:
+                logger.error(f"Неверный формат времени MONTHLY_JOB_TIME: {e}")
+        else:
+            logger.info(f"Задача '{monthly_job_name}' уже была восстановлена из persistence файла.")
+    # <<< КОНЕЦ ИЗМЕНЕНИЯ
 
     holiday_check_conv_handler = ConversationHandler(
         entry_points=[
             MessageHandler(filters.TEXT & filters.Regex(f'^{BTN_GET_HOLIDAYS}$'), start_holiday_check_conversation)],
         states={GET_SPECIFIC_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_specific_date)]},
         fallbacks=[CommandHandler('cancel', cancel_conversation), CommandHandler('start', start)],
+        # <<< ИЗМЕНЕНИЕ: Добавляем персистентность в диалоги
+        persistent=True,
+        name="holiday_check_conv"
+        # <<< КОНЕЦ ИЗМЕНЕНИЯ
     )
 
     report_conv_handler = ConversationHandler(
@@ -242,6 +487,10 @@ def main():
             GET_END_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_end_date)],
         },
         fallbacks=[CommandHandler('cancel', cancel_conversation), CommandHandler('start', start)],
+        # <<< ИЗМЕНЕНИЕ: Добавляем персистентность в диалоги
+        persistent=True,
+        name="report_conv"
+        # <<< КОНЕЦ ИЗМЕНЕНИЯ
     )
 
     application.add_handler(CommandHandler("start", start))

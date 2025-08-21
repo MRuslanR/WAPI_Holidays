@@ -1,3 +1,4 @@
+# utils.py
 import time
 import random
 from functools import wraps
@@ -13,11 +14,19 @@ class APIError(Exception):
     pass
 
 
+# --- ИЗМЕНЕНИЕ: Новое, более специфичное исключение ---
+class InvalidJSONPayloadError(APIError):
+    """Исключение для случаев, когда API вернуло валидный ответ,
+    но полезная нагрузка (payload) внутри него содержит невалидный JSON."""
+    pass
+
+
 def retry_on_exception(
+        # --- ИЗМЕНЕНИЕ: Добавляем InvalidJSONPayloadError в список по умолчанию ---
         tries: int = 3,
         delay_seconds: int = 5,
         backoff_factor: int = 2,
-        exceptions: tuple = (APIError,)
+        exceptions: tuple = (APIError, InvalidJSONPayloadError,)
 ) -> Callable:
     """
     Декоратор для повторного вызова функции при возникновении исключений.

@@ -11,7 +11,8 @@ from requests.packages.urllib3.exceptions import InsecureRequestWarning
 
 from config import (DB_PATH, NIKTA_BASE_URL, get_logger, DEFAULT_REQUEST_TIMEOUT_SECONDS, NIKTA_USER_PASSWORD,
                     NIKTA_USER_EMAIL, NIKTA_DEDUPLICATE_SCENARIO_ID, NIKTA_HOLIDAY_CHECKER_SCENARIO_ID)
-from utils import APIError, retry_on_exception
+# --- ИЗМЕНЕНИЕ: Импортируем новое исключение ---
+from utils import APIError, retry_on_exception, InvalidJSONPayloadError
 
 requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 logger = get_logger(__name__)
@@ -46,7 +47,8 @@ class NiktaAPIClient:
         except (json.JSONDecodeError, KeyError) as e:
             raise APIError(f"Ошибка парсинга ответа при аутентификации: {e}")
 
-    @retry_on_exception(exceptions=(APIError, requests.RequestException))
+    # --- ИЗМЕНЕНИЕ: Декоратор теперь ловит и ошибки JSON ---
+    @retry_on_exception(exceptions=(APIError, requests.RequestException, InvalidJSONPayloadError, json.JSONDecodeError))
     def run_scenario(self, scenario_id: int, message: str, info: dict) -> dict:
         log_ctx = {'api': 'Nikta', 'scenario_id': scenario_id}
         if "Authorization" not in self.session.headers:
@@ -61,7 +63,11 @@ class NiktaAPIClient:
             response = self.session.post(f"{self.base_url}/run", json=payload)
             response.raise_for_status()
             logger.info("Сценарий успешно выполнен.", extra={'context': log_ctx})
+
+            # --- ИЗМЕНЕНИЕ: Теперь мы возвращаем весь ответ, а не только JSON.
+            # Ошибка парсинга всего ответа вызовет retry благодаря декоратору.
             return response.json()
+
         except requests.HTTPError as e:
             if e.response.status_code == 401:
                 logger.error("Ошибка 401. JWT токен, вероятно, истек. Требуется повторная аутентификация.",
@@ -70,8 +76,10 @@ class NiktaAPIClient:
             raise APIError(f"HTTP ошибка: {e.response.status_code} {e.response.text}")
         except requests.RequestException as e:
             raise APIError(f"Сетевая ошибка: {e}")
-        except json.JSONDecodeError:
-            raise APIError(f"Не удалось декодировать JSON из ответа: {response.text}")
+        except json.JSONDecodeError as e:
+            # --- ИЗМЕНЕНИЕ: Явно пробрасываем ошибку декодирования JSON, чтобы декоратор ее поймал
+            logger.warning(f"Не удалось декодировать JSON из ответа: {response.text}", extra={'context': log_ctx})
+            raise e
 
 
 class HolidayService:
@@ -87,15 +95,12 @@ class HolidayService:
         self.session.timeout = DEFAULT_REQUEST_TIMEOUT_SECONDS
         self.logger = get_logger(self.__class__.__name__)
 
-        # Общие счетчики для всего жизненного цикла объекта
         self.grand_total_tokens = 0
         self.grand_total_price = 0.0
 
         self.logger.info("Инициализация HolidayService...")
         self._init_db()
 
-        # Для чтения данных аутентификация не нужна, но оставим для консистентности
-        # если Nikta будет использоваться и для чтения
         try:
             self.nikta_client = NiktaAPIClient(NIKTA_USER_EMAIL, NIKTA_USER_PASSWORD)
             self.nikta_client.authenticate()
@@ -105,7 +110,6 @@ class HolidayService:
             raise RuntimeError(f"Не удалось запустить HolidayService из-за сбоя NiktaAPIClient: {e}") from e
 
     def _init_db(self):
-        """Инициализирует таблицы 'holidays' и 'regions' в БД, если они не существуют."""
         log_ctx = {'service': 'DB', 'operation': 'init'}
         self.logger.info("Проверка и инициализация таблиц БД...", extra={'context': log_ctx})
         try:
@@ -135,30 +139,16 @@ class HolidayService:
             raise
 
     def get_holidays_for_date(self, target_date: str) -> Dict[str, Dict[str, List[str]]]:
-        """
-        Извлекает из БД праздники и их регионы для указанной даты.
-
-        :param target_date: Дата в формате 'YYYY-MM-DD'.
-        :return: Словарь, где ключ - код страны, а значение - другой словарь,
-                 где ключ - название праздника, а значение - список регионов.
-                 Пример: {'RU': {'Новый год': ['RU-MOW', 'RU-SPE'], 'Рождество': []}}
-                 Пустой список регионов означает общенациональный праздник.
-        """
         log_ctx = {'service': 'DB', 'operation': 'get_holidays_with_regions', 'date': target_date}
         self.logger.info(f"Запрос праздников и регионов из БД на дату {target_date}", extra={'context': log_ctx})
-
-        # defaultdict упрощает добавление элементов в вложенные структуры
         holidays_by_country = defaultdict(lambda: defaultdict(list))
-
         try:
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.cursor()
-                # LEFT JOIN, чтобы включить праздники без регионов (национальные)
-                # `r.region_name` будет NULL для них
                 query = """
-                SELECT 
-                    h.country_code, 
-                    h.holiday_name, 
+                SELECT
+                    h.country_code,
+                    h.holiday_name,
                     r.region_name
                 FROM holidays h
                 LEFT JOIN regions r ON h.id = r.holiday_id
@@ -166,30 +156,20 @@ class HolidayService:
                 ORDER BY h.country_code, h.holiday_name
                 """
                 cursor.execute(query, (target_date,))
-
                 for country_code, holiday_name, region_name in cursor.fetchall():
-                    # Добавляем регион только если он не NULL
                     if region_name:
                         holidays_by_country[country_code][holiday_name].append(region_name)
                     else:
-                        # Если регион NULL, просто убеждаемся, что праздник существует в словаре
-                        # с пустым списком регионов. defaultdict уже делает это за нас.
                         _ = holidays_by_country[country_code][holiday_name]
-
-            # Преобразуем defaultdict обратно в обычный dict для чистоты
             final_result = {k: dict(v) for k, v in holidays_by_country.items()}
             self.logger.info(f"Найдено праздников для {len(final_result)} стран.", extra={'context': log_ctx})
             return final_result
-
         except sqlite3.Error as e:
             self.logger.exception(f"Ошибка при чтении праздников из БД на дату {target_date}",
                                   extra={'context': log_ctx})
             return {}
 
-    # --- КОНЕЦ НОВОГО МЕТОДА ---
-
     def _get_from_api(self, source_name: str, url: str, **kwargs) -> List[Dict[str, Any]]:
-        """Унифицированный метод для выполнения запросов к API источников."""
         log_ctx = {'source_api': source_name, 'url': url}
         self.logger.info(f"Запрос данных из {source_name}...", extra={'context': log_ctx})
         try:
@@ -203,7 +183,6 @@ class HolidayService:
         return []
 
     def _get_from_ninjas(self, country_code: str, year: str, month: str) -> List[Dict[str, str]]:
-        """Получает праздники из API-Ninjas."""
         url = f'https://api.api-ninjas.com/v1/workingdays?country={country_code}&month={month}'
         data = self._get_from_api("API-Ninjas", url, headers={'X-Api-Key': self.api_key_ninjas})
         holidays = []
@@ -218,7 +197,6 @@ class HolidayService:
         return holidays
 
     def _get_from_nager(self, country_code: str, year: str, month: str) -> List[Dict[str, str]]:
-        """Получает праздники из Nager.Date API."""
         url = f'https://date.nager.at/api/v3/PublicHolidays/{year}/{country_code}'
         data = self._get_from_api("Nager.Date", url)
         holidays = []
@@ -232,7 +210,6 @@ class HolidayService:
         return holidays
 
     def _get_from_openholidays(self, country_code: str, first_day: str, last_day: str) -> List[Dict[str, str]]:
-        """Получает праздники из OpenHolidaysAPI."""
         url = "https://openholidaysapi.org/PublicHolidays"
         params = {"countryIsoCode": country_code, "languageIsoCode": "EN", "validFrom": first_day, "validTo": last_day}
         data = self._get_from_api("OpenHolidaysAPI", url, params=params, headers={"accept": "text/json"})
@@ -245,36 +222,41 @@ class HolidayService:
         self.logger.info(f"Найдено {len(holidays)} праздников в OpenHolidaysAPI для {country_code}.")
         return holidays
 
-    def _parse_nikta_checker_response(self, response_text: str) -> Optional[Dict[str, Any]]:
-        """Надежно извлекает JSON из ответа сценария проверки фактов."""
+    # --- ИЗМЕНЕНИЕ: Метод теперь выбрасывает исключение при ошибке парсинга ---
+    def _parse_nikta_checker_response(self, response_text: str) -> Dict[str, Any]:
+        """
+        Надежно извлекает JSON из ответа сценария проверки фактов.
+        В случае неудачи выбрасывает InvalidJSONPayloadError, чтобы инициировать повтор.
+        """
         log_ctx = {'service': 'NiktaParser'}
         try:
             json_start_index = response_text.find('{')
             if json_start_index == -1:
-                self.logger.warning("Не найден JSON объект в ответе Nikta.", extra=log_ctx)
-                return None
+                raise InvalidJSONPayloadError(f"Не найден JSON объект в ответе Nikta: '{response_text}'")
+
             if "**Источники:**" in response_text:
                 json_part = response_text[:response_text.find("**Источники:**")]
             else:
                 json_part = response_text
+
             json_end_index = json_part.rfind('}')
             if json_end_index == -1:
-                self.logger.warning("Не найден корректный конец JSON объекта в ответе Nikta.", extra=log_ctx)
-                return None
+                raise InvalidJSONPayloadError(
+                    f"Не найден корректный конец JSON объекта в ответе Nikta: '{response_text}'")
+
             clean_json_str = json_part[json_start_index: json_end_index + 1].strip()
             return json.loads(clean_json_str)
-        except json.JSONDecodeError:
-            self.logger.exception(f"Не удалось декодировать JSON из ответа Nikta. Ответ: '{response_text}'",
-                                  extra=log_ctx)
-        except Exception:
+        except json.JSONDecodeError as e:
+            self.logger.error(f"Не удалось декодировать JSON из ответа Nikta. Ответ: '{response_text}'",
+                              extra=log_ctx, exc_info=True)
+            raise InvalidJSONPayloadError(f"Ошибка декодирования JSON из полезной нагрузки Nikta: {e}") from e
+        except Exception as e:
             self.logger.exception(f"Непредвиденная ошибка при парсинге ответа Nikta. Ответ: '{response_text}'",
                                   extra=log_ctx)
-        return None
+            # Оборачиваем в наше кастомное исключение
+            raise InvalidJSONPayloadError(f"Непредвиденная ошибка парсинга: {e}") from e
 
     def _save_verified_holiday(self, country_code: str, holiday_data: Dict[str, Any]):
-        """
-        Сохраняет один проверенный праздник и связанные с ним регионы в БД в рамках одной транзакции.
-        """
         log_ctx = {'service': 'DB', 'operation': 'save', 'holiday_name': holiday_data.get('name')}
         self.logger.info(f"Сохранение проверенного праздника '{holiday_data.get('name')}' в БД.", extra=log_ctx)
         try:
@@ -315,17 +297,12 @@ class HolidayService:
                               extra=log_ctx)
 
     def process_holidays_for_period(self, country_code: str, year: str, month: str, first_day: str, last_day: str):
-        """
-        Основной метод: собирает, обрабатывает и сохраняет праздники для страны за период.
-        """
         log_ctx = {'country': country_code, 'period': f"{year}-{month}"}
         self.logger.info(f"Начало обработки праздников для страны: {country_code.upper()}", extra={'context': log_ctx})
 
-        # Локальные счетчики для текущей страны
         country_tokens = 0
         country_price = 0.0
 
-        # 1. Сбор данных из всех источников
         raw_holidays = {
             "ninjas_holidays": self._get_from_ninjas(country_code, year, month),
             "nager_holidays": self._get_from_nager(country_code, year, month),
@@ -336,34 +313,38 @@ class HolidayService:
                                 extra={'context': log_ctx})
             return
 
-        # 2. Дедупликация через Nikta
         try:
             self.logger.info("Отправка данных на дедупликацию в Nikta...", extra={'context': log_ctx})
             dedup_result = self.nikta_client.run_scenario(NIKTA_DEDUPLICATE_SCENARIO_ID, str(raw_holidays), {})
 
-            # Подсчет экономики для отдельного запроса
             nikta_tokens = dedup_result.get('tokens', 0)
             nikta_price = dedup_result.get('logs', {}).get('total_price', 0.0)
             self.logger.info(f"[Экономика] Запрос на дедупликацию: {nikta_tokens} токенов, {nikta_price:.4f}$")
 
-            # Обновляем счетчики для страны и общие
             country_tokens += nikta_tokens
             country_price += nikta_price
             self.grand_total_tokens += nikta_tokens
             self.grand_total_price += nikta_price
 
+            # --- ИЗМЕНЕНИЕ: Парсинг происходит здесь. Если он падает, то исключение
+            # ловится внешним `except` блоком. Но теперь мы можем обернуть это в еще один
+            # try-except, чтобы выбросить InvalidJSONPayloadError, если хотим retry.
+            # Однако, для дедупликации лучше оставить как есть - если она сбоит,
+            # то нет смысла продолжать. Главное - это retry для проверки фактов.
             clean_holidays_str = dedup_result.get('result', '{}')
             clean_holidays_data = json.loads(clean_holidays_str)
             holidays_to_check = clean_holidays_data.get('holidays', [])
             self.logger.info(
                 f"Дедупликация завершена. Получено {len(holidays_to_check)} уникальных праздников для проверки.",
                 extra={'context': log_ctx})
-        except (APIError, json.JSONDecodeError) as e:
-            self.logger.exception("Ошибка на этапе дедупликации праздников. Обработка страны прервана.",
-                                  extra={'context': log_ctx})
+
+        # --- ИЗМЕНЕНИЕ: ловим все ошибки, включая InvalidJSONPayloadError и json.JSONDecodeError ---
+        except (APIError, InvalidJSONPayloadError, json.JSONDecodeError) as e:
+            self.logger.exception(
+                "Ошибка на этапе дедупликации праздников после всех попыток. Обработка страны прервана.",
+                extra={'context': log_ctx})
             return
 
-        # 3. Проверка фактов и сохранение
         if not holidays_to_check:
             self.logger.info("После дедупликации не осталось праздников для проверки.", extra={'context': log_ctx})
         else:
@@ -373,24 +354,24 @@ class HolidayService:
                     holiday['region'] = country_code
                     checker_result = self.nikta_client.run_scenario(NIKTA_HOLIDAY_CHECKER_SCENARIO_ID, str(holiday), {})
 
-                    # Подсчет экономики для отдельного запроса
                     nikta_tokens = checker_result.get('tokens', 0)
                     nikta_price = checker_result.get('logs', {}).get('total_price', 0.0)
                     self.logger.info(
                         f"[Экономика] Запрос на проверку факта '{holiday.get('name')}': {nikta_tokens} токенов, {nikta_price:.4f}$.")
 
-                    # Обновляем счетчики для страны и общие
                     country_tokens += nikta_tokens
                     country_price += nikta_price
                     self.grand_total_tokens += nikta_tokens
                     self.grand_total_price += nikta_price
 
-                    verified_data = self._parse_nikta_checker_response(checker_result.get('result', ''))
+                    # --- ИЗМЕНЕНИЕ: Этот вызов теперь может выбросить InvalidJSONPayloadError.
+                    # Это исключение НЕ БУДЕТ поймано внутренним `except APIError`,
+                    # а будет проброшено наверх, где его поймает декоратор на `run_scenario`,
+                    # что и вызовет повторный запуск.
+                    # Мы оборачиваем это в отдельный `try-except`, чтобы поймать ошибку уже ПОСЛЕ всех ретраев.
 
-                    if not verified_data:
-                        self.logger.warning(f"Не удалось разобрать ответ от Nikta для праздника: {holiday}",
-                                            extra={'context': log_ctx})
-                        continue
+                    response_text = checker_result.get('result', '')
+                    verified_data = self._parse_nikta_checker_response(response_text)
 
                     is_holiday_flag = verified_data.get('is_holiday')
                     if str(is_holiday_flag).lower() == 'true':
@@ -399,17 +380,18 @@ class HolidayService:
                     else:
                         self.logger.info(
                             f"Праздник '{holiday.get('name')} - {holiday.get('date')}' НЕ является выходным.")
-                except APIError:
-                    self.logger.exception(f"Ошибка API при проверке праздника: {holiday}. Пропускаем.",
-                                          extra={'context': log_ctx})
-                except Exception:
+
+                # --- ИЗМЕНЕНИЕ: ловим и InvalidJSONPayloadError, чтобы обработать сбой после всех ретраев ---
+                except (APIError, InvalidJSONPayloadError) as e:
+                    self.logger.exception(
+                        f"Ошибка API при проверке праздника '{holiday.get('name')}' после всех попыток. Пропускаем.",
+                        extra={'context': log_ctx})
+                except Exception as e:
                     self.logger.exception(f"Непредвиденная ошибка при обработке праздника: {holiday}. Пропускаем.",
                                           extra={'context': log_ctx})
 
-        # Вывод отчета по экономике для страны через логгер
         self.logger.info(f"Итоги по экономике для страны {country_code.upper()}:")
         self.logger.info(f"  - Потрачено токенов: {country_tokens}")
         self.logger.info(f"  - Общая стоимость: {country_price:.4f}$")
-
         self.logger.info(f"Обработка праздников для страны {country_code.upper()} завершена.",
                          extra={'context': log_ctx})

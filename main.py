@@ -24,7 +24,6 @@ def get_next_date():
     last_day_of_month = calendar.monthrange(year, next_month)[1]
     first_day = date(year, next_month, 1).isoformat()
     last_day = date(year, next_month, last_day_of_month).isoformat()
-    return '2025', '08', '2025-08-01', '2025-08-31'
     return str(year), str(next_month).zfill(2), first_day, last_day
 
 
